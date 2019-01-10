@@ -21,7 +21,7 @@ import (
 type syncDownloadEnumerator common.SyncJobPartOrderRequest
 
 // accept a new transfer, if the threshold is reached, dispatch a job part order
-func (e *syncDownloadEnumerator) addTransferToUpload(transfer common.CopyTransfer, cca *cookedSyncCmdArgs) error {
+func (e *syncDownloadEnumerator) addTransferToDownload(transfer common.CopyTransfer, cca *cookedSyncCmdArgs) error {
 
 	if len(e.CopyJobRequest.Transfers) == NumOfFilesPerDispatchJobPart {
 		resp := common.CopyJobPartOrderResponse{}
@@ -34,7 +34,6 @@ func (e *syncDownloadEnumerator) addTransferToUpload(transfer common.CopyTransfe
 		// if the current part order sent to engine is 0, then set atomicSyncStatus
 		// variable to 1
 		if e.PartNumber == 0 {
-			//cca.waitUntilJobCompletion(false)
 			cca.setFirstPartOrdered()
 		}
 		e.CopyJobRequest.Transfers = []common.CopyTransfer{}
@@ -210,7 +209,7 @@ func (e *syncDownloadEnumerator) listSourceAndCompare(cca *cookedSyncCmdArgs, p 
 					continue
 				}
 			}
-			e.addTransferToUpload(common.CopyTransfer{
+			e.addTransferToDownload(common.CopyTransfer{
 				Source:           util.stripSASFromBlobUrl(util.generateBlobUrl(containerUrl, blobInfo.Name)).String(),
 				Destination:      blobLocalPath,
 				SourceSize:       *blobInfo.Properties.ContentLength,
@@ -256,9 +255,11 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 	var isSourceASingleFile os.FileInfo = nil
 
 	if len(listOfFilesAndDir) == 0 {
-		fInfo, fError := os.Stat(cca.destination)
+		return false, fmt.Errorf("cannot scan the destination %s, please verify that it is a valid path", cca.destination)
+	} else if len(listOfFilesAndDir) == 1 {
+		fInfo, fError := os.Stat(listOfFilesAndDir[0])
 		if fError != nil {
-			return false, fmt.Errorf("cannot scan the destination %s. Failed with error %s", cca.destination, fError)
+			return false, fmt.Errorf("cannot scan the destination %s, please verify that it is a valid path", listOfFilesAndDir[0])
 		}
 		if fInfo.Mode().IsRegular() {
 			isSourceASingleFile = fInfo
@@ -275,7 +276,7 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 		glcm.Exit(fmt.Sprintf("Cannot perform sync between directory %s and blob destination %s. sync only happens between source and destination of same type", cca.source, cca.destination), 1)
 	}
 
-	// If both source is a file and destination is a blob, then we need to do the comparison and queue the transfer if required.
+	// If both source is a blob and destination is a file, then we need to do the comparison and queue the transfer if required.
 	if isSourceASingleFile != nil && bPropertiesError == nil {
 		blobName := sourceURL.Path[strings.LastIndex(sourceURL.Path, "/")+1:]
 		// Compare the blob name and file name
@@ -290,12 +291,14 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 			glcm.Exit(fmt.Sprintf("blob %s and file %s already in sync", blobName, isSourceASingleFile.Name()), 1)
 		}
 
-		e.addTransferToUpload(common.CopyTransfer{
+		e.addTransferToDownload(common.CopyTransfer{
 			Source:           util.stripSASFromBlobUrl(*sourceURL).String(),
 			Destination:      cca.source,
 			SourceSize:       bProperties.ContentLength(),
 			LastModifiedTime: bProperties.LastModified(),
 		}, cca)
+
+		return true, nil
 	}
 
 	sourcePattern := ""
