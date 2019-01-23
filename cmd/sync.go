@@ -39,6 +39,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// a max is set because we cannot buffer infinite amount of destination file info in memory
 const MaxNumberOfFilesAllowedInSync = 10000000
 
 type rawSyncCmdArgs struct {
@@ -52,9 +53,9 @@ type rawSyncCmdArgs struct {
 	exclude        string
 	followSymlinks bool
 	output         string
-	// this flag predefines the user-agreement to delete the files in case sync found some files at destination
-	// which doesn't exists at source. With this flag turned on, user will not be asked for permission before
-	// deleting the flag.
+	// this flag determines the user-agreement to delete the files in case sync found files/blobs at the destination
+	// that do not exist at the source. With this flag turned on, user will not be prompted for permission before
+	// deleting the files/blobs.
 	force bool
 }
 
@@ -72,18 +73,24 @@ func (raw rawSyncCmdArgs) cook() (cookedSyncCmdArgs, error) {
 	}
 	cooked.source = raw.src
 	cooked.destination = raw.dst
-
 	cooked.fromTo = fromTo
-
 	cooked.blockSize = raw.blockSize
-
 	cooked.followSymlinks = raw.followSymlinks
+	cooked.recursive = raw.recursive
+	cooked.force = raw.force
+	cooked.jobID = common.NewJobID()
 
 	err := cooked.logVerbosity.Parse(raw.logVerbosity)
 	if err != nil {
 		return cooked, err
 	}
 
+	err = cooked.output.Parse(raw.output)
+	if err != nil {
+		return cooked, err
+	}
+
+	// TODO follow up on meaning of include, there seems to be user confusion
 	// initialize the include map which contains the list of files to be included
 	// parse the string passed in include flag
 	// more than one file are expected to be separated by ';'
@@ -100,6 +107,7 @@ func (raw rawSyncCmdArgs) cook() (cookedSyncCmdArgs, error) {
 		}
 	}
 
+	// TODO follow up on meaning of exclude, there seems to be user confusion
 	// initialize the exclude map which contains the list of files to be excluded
 	// parse the string passed in exclude flag
 	// more than one file are expected to be separated by ';'
@@ -115,11 +123,6 @@ func (raw rawSyncCmdArgs) cook() (cookedSyncCmdArgs, error) {
 			cooked.exclude[files[index]] = index
 		}
 	}
-
-	cooked.recursive = raw.recursive
-	cooked.output.Parse(raw.output)
-	cooked.jobID = common.NewJobID()
-	cooked.force = raw.force
 	return cooked, nil
 }
 
@@ -167,9 +170,9 @@ type cookedSyncCmdArgs struct {
 	atomicSourceFilesScanned uint64
 	// defines the number of files listed at the destination and compared.
 	atomicDestinationFilesScanned uint64
-	// this flag predefines the user-agreement to delete the files in case sync found some files at destination
-	// which doesn't exists at source. With this flag turned on, user will not be asked for permission before
-	// deleting the flag.
+	// this flag determines the user-agreement to delete the files in case sync found files/blobs at the destination
+	// that do not exist at the source. With this flag turned on, user will not be prompted for permission before
+	// deleting the files/blobs.
 	force bool
 }
 
@@ -236,7 +239,6 @@ func (cca *cookedSyncCmdArgs) Cancel(lcm common.LifecycleMgr) {
 }
 
 func (cca *cookedSyncCmdArgs) ReportProgressOrExit(lcm common.LifecycleMgr) {
-
 	if !cca.scanningComplete() {
 		lcm.Progress(fmt.Sprintf("%v File Scanned at Source, %v Files Scanned at Destination",
 			atomic.LoadUint64(&cca.atomicSourceFilesScanned), atomic.LoadUint64(&cca.atomicDestinationFilesScanned)))
@@ -481,7 +483,6 @@ func init() {
 	rootCmd.AddCommand(syncCmd)
 	syncCmd.PersistentFlags().BoolVar(&raw.recursive, "recursive", false, "Filter: Look into sub-directories recursively when syncing destination to source.")
 	syncCmd.PersistentFlags().Uint32Var(&raw.blockSize, "block-size", 0, "Use this block size when source to Azure Storage or from Azure Storage.")
-	// hidden filters
 	syncCmd.PersistentFlags().StringVar(&raw.include, "include", "", "Filter: only include these files when copying. "+
 		"Support use of *. More than one file are separated by ';'")
 	syncCmd.PersistentFlags().BoolVar(&raw.followSymlinks, "follow-symlinks", false, "Filter: Follow symbolic links when performing sync from local file system.")

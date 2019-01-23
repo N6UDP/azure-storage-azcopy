@@ -89,7 +89,7 @@ type SyncJobPartOrderRequest struct {
 	CommandString  string
 	CredentialInfo CredentialInfo
 
-	SourceFiles map[string]time.Time
+	LocalFiles map[string]time.Time
 
 	SourceFilesToExclude map[string]time.Time
 }

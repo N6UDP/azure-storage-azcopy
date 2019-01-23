@@ -274,10 +274,10 @@ func (e *syncUploadEnumerator) listTheSourceIfRequired(cca *cookedSyncCmdArgs, p
 						e.SourceFilesToExclude[pathToFile] = f.ModTime()
 						return nil
 					}
-					if len(e.SourceFiles) > MaxNumberOfFilesAllowedInSync {
+					if len(e.LocalFiles) > MaxNumberOfFilesAllowedInSync {
 						glcm.Exit(fmt.Sprintf("cannot sync the source %s with more than %v number of files", cca.source, MaxNumberOfFilesAllowedInSync), 1)
 					}
-					e.SourceFiles[pathToFile] = fileInfo.ModTime()
+					e.LocalFiles[pathToFile] = fileInfo.ModTime()
 					// Increment the sync counter.
 					atomic.AddUint64(&cca.atomicSourceFilesScanned, 1)
 				}
@@ -292,10 +292,10 @@ func (e *syncUploadEnumerator) listTheSourceIfRequired(cca *cookedSyncCmdArgs, p
 				e.SourceFilesToExclude[fileOrDir] = f.ModTime()
 				continue
 			}
-			if len(e.SourceFiles) > MaxNumberOfFilesAllowedInSync {
+			if len(e.LocalFiles) > MaxNumberOfFilesAllowedInSync {
 				glcm.Exit(fmt.Sprintf("cannot sync the source %s with more than %v number of files", cca.source, MaxNumberOfFilesAllowedInSync), 1)
 			}
-			e.SourceFiles[fileOrDir] = f.ModTime()
+			e.LocalFiles[fileOrDir] = f.ModTime()
 			// Increment the sync counter.
 			atomic.AddUint64(&cca.atomicSourceFilesScanned, 1)
 		}
@@ -393,7 +393,7 @@ func (e *syncUploadEnumerator) listDestinationAndCompare(cca *cookedSyncCmdArgs,
 			// modified time. If the modified time of file is later than the blob's
 			// modified time, then queue transfer for upload. If not, then delete
 			// blobLocalPath from the map of sourceFiles.
-			localFileTime, found := e.SourceFiles[blobLocalPath]
+			localFileTime, found := e.LocalFiles[blobLocalPath]
 			if found {
 				if localFileTime.After(blobInfo.Properties.LastModified) {
 					e.addTransferToUpload(common.CopyTransfer{
@@ -402,7 +402,7 @@ func (e *syncUploadEnumerator) listDestinationAndCompare(cca *cookedSyncCmdArgs,
 						SourceSize:  *blobInfo.Properties.ContentLength,
 					}, cca)
 				}
-				delete(e.SourceFiles, blobLocalPath)
+				delete(e.LocalFiles, blobLocalPath)
 			} else {
 				// If the blob is not found in the map of source Files, queue it for
 				// delete
@@ -418,7 +418,7 @@ func (e *syncUploadEnumerator) listDestinationAndCompare(cca *cookedSyncCmdArgs,
 	return nil
 }
 
-// queueSourceFilesForUpload
+// queueDstFilesToDelete
 func (e *syncUploadEnumerator) queueSourceFilesForUpload(cca *cookedSyncCmdArgs) {
 	util := copyHandlerUtil{}
 	// rootPath will be the parent source directory before the first wildcard
@@ -442,7 +442,7 @@ func (e *syncUploadEnumerator) queueSourceFilesForUpload(cca *cookedSyncCmdArgs)
 
 	blobUrlParts := azblob.NewBlobURLParts(*destinationUrl)
 
-	for file, _ := range e.SourceFiles {
+	for file, _ := range e.LocalFiles {
 		// get the file Info
 		f, err := os.Stat(file)
 		if err != nil {
@@ -524,7 +524,7 @@ func (e *syncUploadEnumerator) enumerate(cca *cookedSyncCmdArgs) error {
 	e.CopyJobRequest.CredentialInfo = e.CredentialInfo
 	e.DeleteJobRequest.CredentialInfo = e.CredentialInfo
 
-	e.SourceFiles = make(map[string]time.Time)
+	e.LocalFiles = make(map[string]time.Time)
 
 	e.SourceFilesToExclude = make(map[string]time.Time)
 

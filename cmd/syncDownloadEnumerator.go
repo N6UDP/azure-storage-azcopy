@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -21,8 +22,7 @@ import (
 type syncDownloadEnumerator common.SyncJobPartOrderRequest
 
 // accept a new transfer, if the threshold is reached, dispatch a job part order
-func (e *syncDownloadEnumerator) addTransferToUpload(transfer common.CopyTransfer, cca *cookedSyncCmdArgs) error {
-
+func (e *syncDownloadEnumerator) addTransferToDownload(transfer common.CopyTransfer, cca *cookedSyncCmdArgs) error {
 	if len(e.CopyJobRequest.Transfers) == NumOfFilesPerDispatchJobPart {
 		resp := common.CopyJobPartOrderResponse{}
 		e.CopyJobRequest.PartNum = e.PartNumber
@@ -34,7 +34,6 @@ func (e *syncDownloadEnumerator) addTransferToUpload(transfer common.CopyTransfe
 		// if the current part order sent to engine is 0, then set atomicSyncStatus
 		// variable to 1
 		if e.PartNumber == 0 {
-			//cca.waitUntilJobCompletion(false)
 			cca.setFirstPartOrdered()
 		}
 		e.CopyJobRequest.Transfers = []common.CopyTransfer{}
@@ -44,24 +43,18 @@ func (e *syncDownloadEnumerator) addTransferToUpload(transfer common.CopyTransfe
 	return nil
 }
 
-// addTransferToDelete adds the filePath to the list of files to delete locally.
-func (e *syncDownloadEnumerator) addTransferToDelete(filePath string) {
-	e.FilesToDeleteLocally = append(e.FilesToDeleteLocally, filePath)
-}
-
 // we need to send a last part with isFinalPart set to true, along with whatever transfers that still haven't been sent
 func (e *syncDownloadEnumerator) dispatchFinalPart(cca *cookedSyncCmdArgs) error {
 	numberOfCopyTransfers := len(e.CopyJobRequest.Transfers)
 	numberOfDeleteTransfers := len(e.FilesToDeleteLocally)
-	// If the numberoftransfer to copy / delete both are 0
-	// means no transfer has been to queue to send to STE
+	// if the number of transfer to copy / delete both are 0
+	// and no part was dispatched, then it means there is no work to do
 	if numberOfCopyTransfers == 0 && numberOfDeleteTransfers == 0 {
-		glcm.Exit("cannot start job because there are no transfer to upload or delete. "+
-			"The source and destination are in sync", 0)
-		return nil
+		return errors.New("cannot start job because there are no transfer to upload or delete. " +
+			"The source and destination are in sync")
 	}
+
 	if numberOfCopyTransfers > 0 {
-		// Only CopyJobPart Order needs to be sent
 		e.CopyJobRequest.IsFinalPart = true
 		e.CopyJobRequest.PartNum = e.PartNumber
 		var resp common.CopyJobPartOrderResponse
@@ -74,6 +67,7 @@ func (e *syncDownloadEnumerator) dispatchFinalPart(cca *cookedSyncCmdArgs) error
 			cca.setFirstPartOrdered()
 		}
 	}
+
 	if numberOfDeleteTransfers > 0 {
 		answer := ""
 		if cca.force {
@@ -90,6 +84,8 @@ func (e *syncDownloadEnumerator) dispatchFinalPart(cca *cookedSyncCmdArgs) error
 			cca.isEnumerationComplete = true
 			return nil
 		}
+		// TODO if the application crashes while deletions are happening, then this information is lost
+		// TODO however, customers are less likely to resume a sync command. Need to confirm with Sercan.
 		for _, file := range e.FilesToDeleteLocally {
 			err := os.Remove(file)
 			if err != nil {
@@ -104,37 +100,33 @@ func (e *syncDownloadEnumerator) dispatchFinalPart(cca *cookedSyncCmdArgs) error
 	return nil
 }
 
-// listDestinationAndCompare lists the blob under the destination mentioned and verifies whether the blob
-// exists locally or not by checking the expected localPath of blob in the sourceFiles map. If the blob
-// does exists, it compares the last modified time. If it does not exists, it queues the blob for deletion.
+// lists the blobs under the source and verifies whether the blob
+// exists locally or not by checking the expected localPath of blob in the LocalFiles map. If the blob
+// does exists, it compares the last modified time.
 func (e *syncDownloadEnumerator) listSourceAndCompare(cca *cookedSyncCmdArgs, p pipeline.Pipeline) error {
 	util := copyHandlerUtil{}
-
 	ctx := context.WithValue(context.Background(), ste.ServiceAPIVersionOverride, ste.DefaultServiceApiVersion)
 
-	// rootPath is the path of destination without wildCards
-	// For Example: cca.source = C:\a1\a* , so rootPath = C:\a1
-	rootPath, _ := util.sourceRootPathWithoutWildCards(cca.destination)
-	//replace the os path separator  with path separator "/" which is path separator for blobs
-	//sourcePattern = strings.Replace(sourcePattern, string(os.PathSeparator), "/", -1)
+	// destRootPath is the path of destination without wildCards
+	// For Example: cca.destination = C:\a1\a* , so destRootPath = C:\a1
+	destRootPath, _ := util.sourceRootPathWithoutWildCards(cca.destination)
+
+	// the source was already validated, it'd be surprising if we cannot parse it at this time
 	sourceURL, err := url.Parse(cca.source)
-	if err != nil {
-		return fmt.Errorf("error parsing the destinatio url")
-	}
+	common.PanicIfErr(err)
 
 	// since source is a remote url, it will have sas parameter
-	// since sas parameter will be stripped from the source url
+	// since sas parameter was stripped from the source url
 	// while cooking the raw command arguments
-	// source sas is added to url for listing the blobs.
+	// source sas is re-added to url for listing the blobs.
 	sourceURL = util.appendQueryParamToUrl(sourceURL, cca.sourceSAS)
 
+	// get the container URL
 	blobUrlParts := azblob.NewBlobURLParts(*sourceURL)
 	blobURLPartsExtension := blobURLPartsExtension{blobUrlParts}
-
-	containerUrl := util.getContainerUrl(blobUrlParts)
+	containerRawURL := util.getContainerUrl(blobUrlParts)
 	searchPrefix, pattern, _ := blobURLPartsExtension.searchPrefixFromBlobURL()
-
-	containerBlobUrl := azblob.NewContainerURL(containerUrl, p)
+	containerURL := azblob.NewContainerURL(containerRawURL, p)
 
 	// virtual directory is the entire virtual directory path before the blob name
 	// passed in the searchPrefix
@@ -148,15 +140,8 @@ func (e *syncDownloadEnumerator) listSourceAndCompare(cca *cookedSyncCmdArgs, p 
 		virtualDirectory = virtualDirectory[1:]
 	}
 
-	// Get the destination path without the wildcards
-	// This is defined since the files mentioned with exclude flag
-	// & include flag are relative to the Destination
-	// If the Destination has wildcards, then files are relative to the
-	// parent Destination path which is the path of last directory in the Destination
-	// without wildcards
-	// For Example: dst = "/home/user/dir1" parentSourcePath = "/home/user/dir1"
-	// For Example: dst = "/home/user/dir*" parentSourcePath = "/home/user"
-	// For Example: dst = "/home/*" parentSourcePath = "/home"
+	// get the source path without the wildcards
+	// this needs to be defined since the files mentioned with exclude&include flags are relative to the source
 	parentSourcePath := blobUrlParts.BlobName
 	wcIndex := util.firstIndexOfWildCard(parentSourcePath)
 	if wcIndex != -1 {
@@ -164,9 +149,10 @@ func (e *syncDownloadEnumerator) listSourceAndCompare(cca *cookedSyncCmdArgs, p 
 		pathSepIndex := strings.LastIndex(parentSourcePath, common.AZCOPY_PATH_SEPARATOR_STRING)
 		parentSourcePath = parentSourcePath[:pathSepIndex]
 	}
+
 	for marker := (azblob.Marker{}); marker.NotDone(); {
 		// look for all blobs that start with the prefix
-		listBlob, err := containerBlobUrl.ListBlobsFlatSegment(ctx, marker,
+		listBlob, err := containerURL.ListBlobsFlatSegment(ctx, marker,
 			azblob.ListBlobsSegmentOptions{Prefix: searchPrefix})
 		if err != nil {
 			return fmt.Errorf("cannot list blobs for download. Failed with error %s", err.Error())
@@ -179,45 +165,49 @@ func (e *syncDownloadEnumerator) listSourceAndCompare(cca *cookedSyncCmdArgs, p 
 			if !util.matchBlobNameAgainstPattern(pattern, blobInfo.Name, cca.recursive) {
 				continue
 			}
-			// realtivePathofBlobLocally is the local path relative to source at which blob should be downloaded
-			// Example: cca.source ="C:\User1\user-1" cca.destination = "https://<container-name>/virtual-dir?<sig>" blob name = "virtual-dir/a.txt"
-			// realtivePathofBlobLocally = virtual-dir/a.txt
-			relativePathofBlobLocally := util.relativePathToRoot(parentSourcePath, blobInfo.Name, '/')
-			relativePathofBlobLocally = strings.Replace(relativePathofBlobLocally, virtualDirectory, "", 1)
+			// relativePathOfBlobLocally is the local path relative to source at which blob should be downloaded
+			// Example: cca.destination ="C:\User1\user-1" cca.source = "https://<container-name>/virtual-dir?<sig>" blob name = "virtual-dir/a.txt"
+			// relativePathOfBlobLocally = user-1/a.txt
+			relativePathOfBlobLocally := util.relativePathToRoot(parentSourcePath, blobInfo.Name, '/')
+			relativePathOfBlobLocally = strings.Replace(relativePathOfBlobLocally, virtualDirectory, "", 1)
 
-			blobLocalPath := util.generateLocalPath(cca.destination, relativePathofBlobLocally)
+			blobLocalPath := util.generateLocalPath(cca.destination, relativePathOfBlobLocally)
 
-			// Increment the number of files scanned at the destination.
+			// increment the number of files scanned at the source.
 			atomic.AddUint64(&cca.atomicSourceFilesScanned, 1)
 
 			// calculate the expected local path of the blob
-			blobLocalPath = util.generateLocalPath(rootPath, relativePathofBlobLocally)
+			blobLocalPath = util.generateLocalPath(destRootPath, relativePathOfBlobLocally)
 
-			// If the files is found in the list of files to be excluded, then it is not compared
+			// if the files is found in the list of files to be excluded, then it is not compared
 			_, found := e.SourceFilesToExclude[blobLocalPath]
 			if found {
 				continue
 			}
-			// Check if the blob exists in the map of source Files. If the file is
+			// Check if the blob exists in the map of local files. If the file is
 			// found, compare the modified time of the file against the blob's last
 			// modified time. If the modified time of file is later than the blob's
 			// modified time, then queue transfer for upload. If not, then delete
 			// blobLocalPath from the map of sourceFiles.
-			localFileTime, found := e.SourceFiles[blobLocalPath]
+			localFileTime, found := e.LocalFiles[blobLocalPath]
 			if found {
 				if !blobInfo.Properties.LastModified.After(localFileTime) {
-					delete(e.SourceFiles, blobLocalPath)
+					delete(e.LocalFiles, blobLocalPath)
 					continue
 				}
 			}
-			e.addTransferToUpload(common.CopyTransfer{
-				Source:           util.stripSASFromBlobUrl(util.generateBlobUrl(containerUrl, blobInfo.Name)).String(),
+			err = e.addTransferToDownload(common.CopyTransfer{
+				Source:           util.stripSASFromBlobUrl(util.generateBlobUrl(containerRawURL, blobInfo.Name)).String(),
 				Destination:      blobLocalPath,
 				SourceSize:       *blobInfo.Properties.ContentLength,
 				LastModifiedTime: blobInfo.Properties.LastModified,
 			}, cca)
 
-			delete(e.SourceFiles, blobLocalPath)
+			if err != nil {
+				return err
+			}
+
+			delete(e.LocalFiles, blobLocalPath)
 		}
 		marker = listBlob.NextMarker
 	}
@@ -228,86 +218,109 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 	ctx := context.WithValue(context.Background(), ste.ServiceAPIVersionOverride, ste.DefaultServiceApiVersion)
 	util := copyHandlerUtil{}
 
-	// attempt to parse the destination url
-	sourceURL, err := url.Parse(cca.source)
-	// the destination should have already been validated, it would be surprising if it cannot be parsed at this point
-	common.PanicIfErr(err)
-
-	// since destination is a remote url, it will have sas parameter
-	// since sas parameter will be stripped from the destination url
-	// while cooking the raw command arguments
-	// destination sas is added to url for listing the blobs.
-	sourceURL = util.appendQueryParamToUrl(sourceURL, cca.sourceSAS)
-
-	blobUrl := azblob.NewBlobURL(*sourceURL, p)
-
-	// Get the files and directories for the given source pattern
-	listOfFilesAndDir, lofaderr := filepath.Glob(cca.destination)
-	if lofaderr != nil {
-		return false, fmt.Errorf("error getting the files and directories for source pattern %s", cca.source)
+	// get the files and directories for the given destination pattern
+	listOfFilesAndDir, err := filepath.Glob(cca.destination)
+	if err != nil {
+		return false, fmt.Errorf("error finding the files and directories for destination pattern %s", cca.destination)
 	}
 
-	// Get the blob Properties
-	bProperties, bPropertiesError := blobUrl.GetProperties(ctx, azblob.BlobAccessConditions{})
-
-	// isSourceASingleFile is used to determine whether given source pattern represents single file or not
-	// If the source is a single file, this pointer will not be nil
-	// if it is nil, it means the source is a directory or list of file
-	var isSourceASingleFile os.FileInfo = nil
+	// isDstSingleFile is used to determine whether the given destination pattern represents single file or not
+	// if the source is a single file, this pointer will not be nil
+	// if it is nil, it means the source is a directory or list of files
+	var isDstSingleFile os.FileInfo = nil
 
 	if len(listOfFilesAndDir) == 0 {
+		return false, fmt.Errorf("cannot scan the destination %s, please verify that it is a valid path", cca.destination)
+	} else if len(listOfFilesAndDir) == 1 {
 		fInfo, fError := os.Stat(listOfFilesAndDir[0])
 		if fError != nil {
-			return false, fmt.Errorf("cannot get the information of the %s. Failed with error %s", listOfFilesAndDir[0], fError)
+			return false, fmt.Errorf("cannot scan the destination %s, please verify that it is a valid path", listOfFilesAndDir[0])
 		}
 		if fInfo.Mode().IsRegular() {
-			isSourceASingleFile = fInfo
+			isDstSingleFile = fInfo
 		}
 	}
 
-	// sync only happens between the source and destination of same type i.e between blob and blob or between Directory and Virtual Folder / Container
-	// If the source is a file and destination is not a blob, sync fails.
-	if isSourceASingleFile != nil && bPropertiesError != nil {
-		glcm.Exit(fmt.Sprintf("Cannot perform sync between file %s and non blob destination %s. sync only happens between source and destination of same type", cca.source, cca.destination), 1)
+	// attempt to parse the source url
+	sourceURL, err := url.Parse(cca.source)
+	// the source should have already been validated, it would be surprising if it cannot be parsed at this point
+	common.PanicIfErr(err)
+
+	// since source is a remote url, it will have sas parameter
+	// sas parameter was stripped from the url while cooking the raw command arguments
+	// source sas is re-added to url for listing the blobs
+	sourceURL = util.appendQueryParamToUrl(sourceURL, cca.sourceSAS)
+	blobUrl := azblob.NewBlobURL(*sourceURL, p)
+
+	// get the blob Properties to see whether the source is a single blob
+	bProperties, bPropertiesError := blobUrl.GetProperties(ctx, azblob.BlobAccessConditions{})
+
+	// sync only happens between the source and destination of same type
+	// i.e between blob and local file or between virtual directory/container and local directory
+	// if the source is a blob and destination is not a local file, sync fails.
+	if isDstSingleFile != nil && bPropertiesError != nil {
+		return true, fmt.Errorf("cannot perform sync between blob %s and non-file destination %s. Sync only happens between source and destination of same type", cca.source, cca.destination)
 	}
-	// If the source is a directory and destination is a blob
-	if isSourceASingleFile == nil && bPropertiesError == nil {
-		glcm.Exit(fmt.Sprintf("Cannot perform sync between directory %s and blob destination %s. sync only happens between source and destination of same type", cca.source, cca.destination), 1)
+	// if the source is a virtual directory/container and destination is a file
+	if isDstSingleFile == nil && bPropertiesError == nil {
+		return false, fmt.Errorf("cannot perform sync between virtual directory/container %s and file destination %s. Sync only happens between source and destination of same type", cca.source, cca.destination)
 	}
 
-	// If both source is a file and destination is a blob, then we need to do the comparison and queue the transfer if required.
-	if isSourceASingleFile != nil && bPropertiesError == nil {
+	// if both source is a blob and destination is a file, then we need to do the comparison and queue the transfer if required
+	if isDstSingleFile != nil && bPropertiesError == nil {
 		blobName := sourceURL.Path[strings.LastIndex(sourceURL.Path, "/")+1:]
-		// Compare the blob name and file name
-		// blobName and filename should be same for sync to happen
-		if strings.Compare(blobName, isSourceASingleFile.Name()) != 0 {
-			glcm.Exit(fmt.Sprintf("sync cannot be done since blob %s and filename %s doesn't match", blobName, isSourceASingleFile.Name()), 1)
+		// compare the blob name and file name, blobName and filename should be same for sync to happen
+		if strings.Compare(blobName, isDstSingleFile.Name()) != 0 {
+			return true, fmt.Errorf("sync cannot be done since blob %s and filename %s do not match", blobName, isDstSingleFile.Name())
 		}
 
-		// If the modified time of file local is not later than that of blob
-		// sync does not needs to happen.
-		if isSourceASingleFile.ModTime().After(bProperties.LastModified()) {
-			glcm.Exit(fmt.Sprintf("blob %s and file %s already in sync", blobName, isSourceASingleFile.Name()), 1)
+		// if the modified time of local file is later than that of blob
+		// sync does not needs to happen
+		if isDstSingleFile.ModTime().After(bProperties.LastModified()) {
+			return true, fmt.Errorf("blob %s and file %s already in sync", blobName, isDstSingleFile.Name())
 		}
 
-		e.addTransferToUpload(common.CopyTransfer{
+		err = e.addTransferToDownload(common.CopyTransfer{
 			Source:           util.stripSASFromBlobUrl(*sourceURL).String(),
-			Destination:      cca.source,
+			Destination:      listOfFilesAndDir[0],
 			SourceSize:       bProperties.ContentLength(),
 			LastModifiedTime: bProperties.LastModified(),
 		}, cca)
+
+		if err != nil {
+			return true, err
+		}
+
+		return true, nil
 	}
 
+	// TODO it's pretty confusing how the patterns and include/exclude play together
+	// TODO this command seems overly complicated and hard to use, we should reconsider the command syntax
 	sourcePattern := ""
 	// Parse the source URL into blob URL parts.
 	blobUrlParts := azblob.NewBlobURLParts(*sourceURL)
-	// get the root path without wildCards and get the source Pattern
+	// get the root path without wildCards and get the source pattern
 	// For Example: source = <container-name>/a*/*/*
 	// rootPath = <container-name> sourcePattern = a*/*/*
 	blobUrlParts.BlobName, sourcePattern = util.sourceRootPathWithoutWildCards(blobUrlParts.BlobName)
 
-	// Iterate through each file / dir inside the source
-	// and then checkAndQueue
+	getRelativePath := func(fileOrDir string) (localFileRelativePath string) {
+		// replace the OS path separator in fileOrDir string with AZCOPY_PATH_SEPARATOR
+		// this replacement is done to handle the windows file paths where path separator "\\"
+		fileOrDir = strings.Replace(fileOrDir, common.OS_PATH_SEPARATOR, common.AZCOPY_PATH_SEPARATOR_STRING, -1)
+
+		// localFileRelativePath is the path of file relative to root directory
+		// Example1: root = C:\User\user1\dir-1  fileAbsolutePath = :\User\user1\dir-1\a.txt localFileRelativePath = \a.txt
+		// Example2: root = C:\User\user1\dir-1  fileAbsolutePath = :\User\user1\dir-1\dir-2\a.txt localFileRelativePath = \dir-2\a.txt
+		localFileRelativePath = strings.Replace(fileOrDir, cca.destination, "", 1)
+		// remove the path separator at the start of relative path
+		if len(localFileRelativePath) > 0 && localFileRelativePath[0] == common.AZCOPY_PATH_SEPARATOR_CHAR {
+			localFileRelativePath = localFileRelativePath[1:]
+		}
+		return
+	}
+
+	// iterate through each file/dir inside the destination
 	for _, fileOrDir := range listOfFilesAndDir {
 		f, err := os.Stat(fileOrDir)
 		if err != nil {
@@ -323,20 +336,10 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 				if fileInfo.IsDir() {
 					return nil
 				} else {
-					// replace the OS path separator in pathToFile string with AZCOPY_PATH_SEPARATOR
-					// this replacement is done to handle the windows file paths where path separator "\\"
-					pathToFile = strings.Replace(pathToFile, common.OS_PATH_SEPARATOR, common.AZCOPY_PATH_SEPARATOR_STRING, -1)
+					localFileRelativePath := getRelativePath(pathToFile)
 
-					// localfileRelativePath is the path of file relative to root directory
-					// Example1: root = C:\User\user1\dir-1  fileAbsolutePath = :\User\user1\dir-1\a.txt localfileRelativePath = \a.txt
-					// Example2: root = C:\User\user1\dir-1  fileAbsolutePath = :\User\user1\dir-1\dir-2\a.txt localfileRelativePath = \dir-2\a.txt
-					localfileRelativePath := strings.Replace(pathToFile, cca.destination, "", 1)
-					// remove the path separator at the start of relative path
-					if len(localfileRelativePath) > 0 && localfileRelativePath[0] == common.AZCOPY_PATH_SEPARATOR_CHAR {
-						localfileRelativePath = localfileRelativePath[1:]
-					}
-					// if the localfileRelativePath does not match the source pattern, then it is not compared
-					if !util.matchBlobNameAgainstPattern(sourcePattern, localfileRelativePath, cca.recursive) {
+					// if the localFileRelativePath does not match the source pattern, then it is not compared
+					if !util.matchBlobNameAgainstPattern(sourcePattern, localFileRelativePath, cca.recursive) {
 						return nil
 					}
 
@@ -344,30 +347,20 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 						e.SourceFilesToExclude[pathToFile] = fileInfo.ModTime()
 						return nil
 					}
-					if len(e.SourceFiles) > MaxNumberOfFilesAllowedInSync {
-						glcm.Exit(fmt.Sprintf("cannot sync the source %s with more than %v number of files", cca.source, MaxNumberOfFilesAllowedInSync), 1)
+					if len(e.LocalFiles) > MaxNumberOfFilesAllowedInSync {
+						glcm.Exit(fmt.Sprintf("cannot sync the source %s with more than %v number of files", cca.source, MaxNumberOfFilesAllowedInSync), common.EExitCode.Error())
 					}
-					e.SourceFiles[pathToFile] = fileInfo.ModTime()
+					e.LocalFiles[pathToFile] = fileInfo.ModTime()
 					// Increment the sync counter.
 					atomic.AddUint64(&cca.atomicDestinationFilesScanned, 1)
 				}
 				return nil
 			})
 		} else if !f.IsDir() {
-			// replace the OS path separator in fileOrDir string with AZCOPY_PATH_SEPARATOR
-			// this replacement is done to handle the windows file paths where path separator "\\"
-			fileOrDir = strings.Replace(fileOrDir, common.OS_PATH_SEPARATOR, common.AZCOPY_PATH_SEPARATOR_STRING, -1)
+			localFileRelativePath := getRelativePath(fileOrDir)
 
-			// localfileRelativePath is the path of file relative to root directory
-			// Example1: root = C:\User\user1\dir-1  fileAbsolutePath = :\User\user1\dir-1\a.txt localfileRelativePath = \a.txt
-			// Example2: root = C:\User\user1\dir-1  fileAbsolutePath = :\User\user1\dir-1\dir-2\a.txt localfileRelativePath = \dir-2\a.txt
-			localfileRelativePath := strings.Replace(fileOrDir, cca.destination, "", 1)
-			// remove the path separator at the start of relative path
-			if len(localfileRelativePath) > 0 && localfileRelativePath[0] == common.AZCOPY_PATH_SEPARATOR_CHAR {
-				localfileRelativePath = localfileRelativePath[1:]
-			}
-			// if the localfileRelativePath does not match the source pattern, then it is not compared
-			if !util.matchBlobNameAgainstPattern(sourcePattern, localfileRelativePath, cca.recursive) {
+			// if the localFileRelativePath does not match the source pattern, then it is not compared
+			if !util.matchBlobNameAgainstPattern(sourcePattern, localFileRelativePath, cca.recursive) {
 				continue
 			}
 
@@ -376,10 +369,10 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 				continue
 			}
 
-			if len(e.SourceFiles) > MaxNumberOfFilesAllowedInSync {
-				glcm.Exit(fmt.Sprintf("cannot sync the source %s with more than %v number of files", cca.source, MaxNumberOfFilesAllowedInSync), 1)
+			if len(e.LocalFiles) > MaxNumberOfFilesAllowedInSync {
+				glcm.Exit(fmt.Sprintf("cannot sync the source %s with more than %v number of files", cca.source, MaxNumberOfFilesAllowedInSync), common.EExitCode.Error())
 			}
-			e.SourceFiles[fileOrDir] = f.ModTime()
+			e.LocalFiles[fileOrDir] = f.ModTime()
 			// Increment the sync counter.
 			atomic.AddUint64(&cca.atomicDestinationFilesScanned, 1)
 		}
@@ -387,66 +380,36 @@ func (e *syncDownloadEnumerator) listTheDestinationIfRequired(cca *cookedSyncCmd
 	return false, nil
 }
 
-// queueSourceFilesForUpload
-func (e *syncDownloadEnumerator) queueSourceFilesForUpload(cca *cookedSyncCmdArgs) {
-	for file, _ := range e.SourceFiles {
-		e.addTransferToDelete(file)
+// queueLocalFilesForDeletion
+func (e *syncDownloadEnumerator) queueLocalFilesForDeletion(cca *cookedSyncCmdArgs) {
+	for file := range e.LocalFiles {
+		e.FilesToDeleteLocally = append(e.FilesToDeleteLocally, file)
 	}
 }
 
 // this function accepts the list of files/directories to transfer and processes them
 func (e *syncDownloadEnumerator) enumerate(cca *cookedSyncCmdArgs) error {
 	ctx := context.WithValue(context.TODO(), ste.ServiceAPIVersionOverride, ste.DefaultServiceApiVersion)
-
 	p, err := createBlobPipeline(ctx, e.CredentialInfo)
 	if err != nil {
 		return err
 	}
 
-	// Copying the JobId of sync job to individual copyJobRequest
+	// the copy job request is used to send job part orders
+	// the delete job request is not needed, since the delete operations are performed by the enumerator
 	e.CopyJobRequest.JobID = e.JobID
-	// Copying the FromTo of sync job to individual copyJobRequest
 	e.CopyJobRequest.FromTo = e.FromTo
-
-	// set the sas of user given Source
 	e.CopyJobRequest.SourceSAS = e.SourceSAS
-
-	// set the sas of user given destination
 	e.CopyJobRequest.DestinationSAS = e.DestinationSAS
-
-	// Set the preserve-last-modified-time to true in CopyJobRequest
 	e.CopyJobRequest.BlobAttributes.PreserveLastModifiedTime = true
-
-	// Copying the JobId of sync job to individual deleteJobRequest.
-	e.DeleteJobRequest.JobID = e.JobID
-	// FromTo of DeleteJobRequest will be BlobTrash.
-	e.DeleteJobRequest.FromTo = common.EFromTo.BlobTrash()
-
-	// set the sas of user given Source
-	e.DeleteJobRequest.SourceSAS = e.SourceSAS
-
-	// set the sas of user given destination
-	e.DeleteJobRequest.DestinationSAS = e.DestinationSAS
-
-	// set force wriet flag to true
 	e.CopyJobRequest.ForceWrite = true
-
-	//Set the log level
 	e.CopyJobRequest.LogLevel = e.LogLevel
-	e.DeleteJobRequest.LogLevel = e.LogLevel
-
-	// Copy the sync Command String to the CopyJobPartRequest and DeleteJobRequest
 	e.CopyJobRequest.CommandString = e.CommandString
-	e.DeleteJobRequest.CommandString = e.CommandString
-
-	// Set credential info properly
 	e.CopyJobRequest.CredentialInfo = e.CredentialInfo
-	e.DeleteJobRequest.CredentialInfo = e.CredentialInfo
-
-	e.SourceFiles = make(map[string]time.Time)
-
+	e.LocalFiles = make(map[string]time.Time)
 	e.SourceFilesToExclude = make(map[string]time.Time)
 
+	// scanning progress should be printed
 	cca.waitUntilJobCompletion(false)
 
 	isSourceABlob, err := e.listTheDestinationIfRequired(cca, p)
@@ -454,7 +417,7 @@ func (e *syncDownloadEnumerator) enumerate(cca *cookedSyncCmdArgs) error {
 		return err
 	}
 
-	// If the source provided is a blob, then remote doesn't needs to be compared against the local
+	// if the source provided is a blob, then remote doesn't needs to be compared against the local
 	// since single blob already has been compared against the file
 	if !isSourceABlob {
 		err = e.listSourceAndCompare(cca, p)
@@ -463,7 +426,7 @@ func (e *syncDownloadEnumerator) enumerate(cca *cookedSyncCmdArgs) error {
 		}
 	}
 
-	e.queueSourceFilesForUpload(cca)
+	e.queueLocalFilesForDeletion(cca)
 
 	// No Job Part has been dispatched, then dispatch the JobPart.
 	if e.PartNumber == 0 ||
