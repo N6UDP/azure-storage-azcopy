@@ -22,7 +22,9 @@ package common
 
 import (
 	"context"
+	"crypto/md5"
 	"errors"
+	"hash"
 	"io"
 	"math"
 	"sync/atomic"
@@ -33,7 +35,7 @@ import (
 type ChunkedFileWriter interface {
 
 	// WaitToScheduleChunk blocks until enough RAM is available to handle the given chunk, then it
-	// "reserves" that amount of RAM in the CacheLimiter and returns. 
+	// "reserves" that amount of RAM in the CacheLimiter and returns.
 	WaitToScheduleChunk(ctx context.Context, id ChunkID, chunkSize int64) error
 
 	// EnqueueChunk hands the given chunkContents over to the ChunkedFileWriter, to be written to disk.
@@ -46,7 +48,7 @@ type ChunkedFileWriter interface {
 
 	// Flush will block until all the chunks have been written to disk.  err will be non-nil if and only in any chunk failed to write.
 	// Flush must be called exactly once, after all chunks have been enqueued with EnqueueChunk.
-	Flush(ctx context.Context) (md5Hash string, err error)
+	Flush(ctx context.Context) (md5HashOfFileAsWritten []byte, err error)
 
 	// MaxRetryPerDownloadBody returns the maximum number of retries that will be done for the download of a single chunk body
 	MaxRetryPerDownloadBody() int
@@ -79,7 +81,7 @@ type chunkedFileWriter struct {
 	creationTime time.Time
 
 	// used for completion
-	successMd5   chan string // TODO: use this when we do MD5s
+	successMd5   chan []byte
 	failureError chan error
 
 	// controls body-read retries. Public so value can be shared with retryReader
@@ -102,7 +104,7 @@ func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheL
 		slicePool:               slicePool,
 		cacheLimiter:            cacheLimiter,
 		chunkLogger:             chunkLogger,
-		successMd5:              make(chan string),
+		successMd5:              make(chan []byte),
 		failureError:            make(chan error, 1),
 		newUnorderedChunks:      make(chan fileChunk, chanBufferSize),
 		creationTime:            time.Now(),
@@ -123,7 +125,7 @@ const maxDesirableActiveChunks = 20 // TODO: can we find a sensible way to remov
 // at the time of scheduling the chunk (which is when this routine should be called).
 // Is here, as method of this struct, for symmetry with the point where we remove it's count
 // from the cache limiter, which is also in this struct.
-func (w *chunkedFileWriter) WaitToScheduleChunk(ctx context.Context, id ChunkID, chunkSize int64) error{
+func (w *chunkedFileWriter) WaitToScheduleChunk(ctx context.Context, id ChunkID, chunkSize int64) error {
 	w.chunkLogger.LogChunkStatus(id, EWaitReason.RAMToSchedule())
 	err := w.cacheLimiter.WaitUntilAddBytes(ctx, chunkSize, w.shouldUseRelaxedRamThreshold)
 	if err == nil {
@@ -160,8 +162,8 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, retryForcer func()
 	}
 }
 
-// Waits until all chunks have been flush to disk, then returns
-func (w *chunkedFileWriter) Flush(ctx context.Context) (string, error) {
+// Flush waits until all chunks have been flush to disk, then returns the MD5 has of the file's bytes-as-we-saved-them
+func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error) {
 	// let worker know that no more will be coming
 	close(w.newUnorderedChunks)
 
@@ -169,13 +171,13 @@ func (w *chunkedFileWriter) Flush(ctx context.Context) (string, error) {
 	select {
 	case err := <-w.failureError:
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return "", ChunkWriterAlreadyFailed // channel returned nil because it was closed and empty
+		return nil, ChunkWriterAlreadyFailed // channel returned nil because it was closed and empty
 	case <-ctx.Done():
-		return "", ctx.Err()
-	case hashAsAtCompletion := <-w.successMd5:
-		return hashAsAtCompletion, nil
+		return nil, ctx.Err()
+	case md5AtCompletion := <-w.successMd5:
+		return md5AtCompletion, nil
 	}
 }
 
@@ -191,6 +193,7 @@ func (w *chunkedFileWriter) MaxRetryPerDownloadBody() int {
 func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 	nextOffsetToSave := int64(0)
 	unsavedChunksByFileOffset := make(map[int64]fileChunk)
+	md5Hasher := md5.New()
 
 	for {
 		var newChunk fileChunk
@@ -202,8 +205,8 @@ func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 			if !channelIsOpen {
 				// If channel is closed, we know that flush as been called and we have read everything
 				// So we are finished
-				// TODO: add returning of MD5 hash in the next line
-				w.successMd5 <- "" // everything is done. We know there was no error, because if there was an error we would have returned before now
+				// We know there was no error, because if there was an error we would have returned before now
+				w.successMd5 <- md5Hasher.Sum(nil)
 				return
 			}
 		case <-ctx.Done():
@@ -217,7 +220,7 @@ func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 		w.chunkLogger.LogChunkStatus(newChunk.id, EWaitReason.PriorChunk()) // may have to wait on prior chunks to arrive
 
 		// Process all chunks that we can
-		err := w.saveAvailableChunks(unsavedChunksByFileOffset, &nextOffsetToSave)
+		err := w.sequentiallyProcessAvailableChunks(unsavedChunksByFileOffset, &nextOffsetToSave, md5Hasher)
 		if err != nil {
 			w.failureError <- err
 			close(w.failureError) // must close because many goroutines may be calling the public methods, and all need to be able to tell there's been an error, even tho only one will get the actual error
@@ -226,16 +229,21 @@ func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 	}
 }
 
-// Saves available chunks that are sequential from nextOffsetToSave. Stops and returns as soon as it hits
+// Hashes and saves available chunks that are sequential from nextOffsetToSave. Stops and returns as soon as it hits
 // a gap (i.e. the position of a chunk that hasn't arrived yet)
-func (w *chunkedFileWriter) saveAvailableChunks(unsavedChunksByFileOffset map[int64]fileChunk, nextOffsetToSave *int64) error {
+func (w *chunkedFileWriter) sequentiallyProcessAvailableChunks(unsavedChunksByFileOffset map[int64]fileChunk, nextOffsetToSave *int64, md5Hasher hash.Hash) error {
 	for {
+		// Look for next chunk in sequence
 		nextChunkInSequence, exists := unsavedChunksByFileOffset[*nextOffsetToSave]
 		if !exists {
 			return nil //its not there yet. That's OK.
 		}
-		*nextOffsetToSave += int64(len(nextChunkInSequence.data))
+		*nextOffsetToSave += int64(len(nextChunkInSequence.data)) // update immediately so we won't forget!
 
+		// Add it to the hash (must do so sequentially for MD5)
+		md5Hasher.Write(nextChunkInSequence.data)
+
+		// Save it
 		err := w.saveOneChunk(nextChunkInSequence)
 		if err != nil {
 			return err
@@ -268,7 +276,6 @@ func (w *chunkedFileWriter) saveOneChunk(chunk fileChunk) error {
 func (w *chunkedFileWriter) shouldUseRelaxedRamThreshold() bool {
 	return atomic.LoadInt32(&w.activeChunkCount) <= maxDesirableActiveChunks
 }
-
 
 // Are we currently in a memory-constrained situation?
 func (w *chunkedFileWriter) haveMemoryPressure(chunkSize int64) bool {
